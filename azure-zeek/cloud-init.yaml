@@ -1,0 +1,49 @@
+#cloud-config
+# Installs Zeek (LTS) on Ubuntu 24.04 from the official openSUSE Build Service repo,
+# configures it for the VM's primary interface, and starts it with zeekctl.
+package_update: true
+packages:
+  - curl
+  - gnupg
+
+write_files:
+  - path: /usr/local/bin/install-zeek.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      # Zeek pulls in postfix for email alerts; skip its interactive setup.
+      echo "postfix postfix/main_mailer_type select No configuration" | debconf-set-selections
+
+      REPO=https://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04
+      curl -fsSL "$REPO/Release.key" | gpg --dearmor -o /etc/apt/trusted.gpg.d/security_zeek.gpg
+      echo "deb $REPO/ /" > /etc/apt/sources.list.d/security:zeek.list
+      apt-get update
+      apt-get install -y zeek-lts
+
+      ln -sf /opt/zeek/bin/zeek /opt/zeek/bin/zeekctl /usr/local/bin/
+      echo 'export PATH=/opt/zeek/bin:$PATH' > /etc/profile.d/zeek.sh
+
+      IFACE=$(ip route show default | awk '{print $5; exit}')
+      sed -i "s/^interface=.*/interface=${IFACE}/" /opt/zeek/etc/node.cfg
+
+      # Treat the VM's virtual network (Azure default 10.0.0.0/16) as local.
+      cat > /opt/zeek/etc/networks.cfg <<NETS
+      10.0.0.0/8      Private IP space
+      172.16.0.0/12   Private IP space
+      192.168.0.0/16  Private IP space
+      NETS
+
+      # Log JSON instead of TSV so logs are easy to ship to a SIEM.
+      echo '@load policy/tuning/json-logs.zeek' >> /opt/zeek/share/zeek/site/local.zeek
+
+      /opt/zeek/bin/zeekctl install
+      /opt/zeek/bin/zeekctl deploy
+
+      # zeekctl cron restarts Zeek if it crashes and rotates logs.
+      echo '*/5 * * * * root /opt/zeek/bin/zeekctl cron' > /etc/cron.d/zeek
+
+runcmd:
+  - /usr/local/bin/install-zeek.sh > /var/log/install-zeek.log 2>&1
